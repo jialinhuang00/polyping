@@ -36,35 +36,101 @@ Server listens on :8080 (HTTP) and :50051 (gRPC).
 
 ---
 
+## Web vs Go Client: Communication Differences
+
+Both clients talk to the same server. Most of the time, the server can't tell them apart. But the disconnect and cancellation paths differ.
+
+| Pattern | Web client | Go client |
+|---------|-----------|-----------|
+| REST | No difference. Both send HTTP GET, both get JSON back. | |
+| SSE disconnect | `EventSource` sends explicit signal. Auto-reconnects on drop. | `resp.Body.Close()` drops TCP. No auto-reconnect. |
+| WS close | Browser sends close frame (opcode 0x8). `onclose` callback fires. | `conn.Close()` sends the same close frame. You handle the error from `ReadMessage`. |
+| WS server-side | Needs a reader goroutine to detect the close frame. Without it, server pushes forever. | Same. |
+| Long Poll cancel | `AbortController` aborts pending request. Server's `r.Context().Done()` fires. | No cancel. Blocks on `http.Get(...)` until response. Ctrl+C kills the process. |
+| gRPC | Browser can't call gRPC. Needs a gRPC-Web proxy (Envoy) in between. | Calls `localhost:50051` directly over HTTP/2. |
+
+---
+
 ## How Each Pattern Works
 
 ### REST
 
-The simplest one. Client sends a request, server sends a response, connection closes. Every interaction is independent.
+Client sends GET. Server returns JSON. Connection closes. Next request, new connection.
 
-**Web**: Click "Send Ping". `fetch('/rest/ping')` fires, response shows in the log.
+**How the server handles it**:
 
-**Go client**: `http.Get(...)`, read JSON, print. One shot, exits.
+```go
+func restHandler(w http.ResponseWriter, r *http.Request) {
+    json.NewEncoder(w).Encode(map[string]string{"message": "pong"})
+}
+```
 
-Same thing. Both use HTTP GET. Both get JSON back. The only difference is one runs in a browser, the other in a terminal.
+One function. Stateless. No difference whether the request came from a browser or a Go binary.
+
+**Web vs Go client**: Identical communication. Web uses `fetch('/rest/ping')`, Go uses `http.Get(...)`. Both send the same HTTP GET, both get the same JSON back. Server can't tell them apart.
 
 ### SSE (Server-Sent Events)
 
-Client opens one HTTP connection. Server never closes it. It keeps writing `data: pong\n\n` down the wire every second. The client doesn't talk back -- it just listens.
+Client opens one HTTP connection. Server never closes it. It keeps writing `data: pong\n\n` down the wire every second. Client just listens.
 
-**Web**: Click "Connect". Browser opens an `EventSource`. Messages appear in the log, one per second. Click "Disconnect" to close.
+**How the server handles it**:
 
-**Go client**: `http.Get(...)` returns a response body that never ends. `bufio.Scanner` reads it line by line. Each `Scan()` blocks until the next line arrives. Prints `server -> pong (20:30:08)` with timestamps.
+```go
+for {
+    fmt.Fprintf(w, "data: pong\n\n")
+    flusher.Flush()
+    time.Sleep(1 * time.Second)
+}
+```
 
-Browser has `EventSource` with auto-reconnect built in. Go has nothing -- you read the body with a scanner. Same stream, different API.
+It's a loop that writes to the response body and flushes. The HTTP response never "finishes." The connection stays open until the client disconnects or the server crashes.
+
+**Web vs Go client -- the disconnect difference**:
+
+The browser's `EventSource` API sends a proper close signal when you call `.close()`. The server's `r.Context().Done()` fires immediately.
+
+The Go client has no such API. It just calls `resp.Body.Close()`. From the server's perspective, the next `Flush()` fails and the handler returns. Same result, but the mechanism is different: browser sends an explicit signal, Go just drops the TCP connection.
+
+Another difference: `EventSource` auto-reconnects if the connection drops. The Go client doesn't -- you'd have to build that retry loop yourself.
 
 ### WebSocket
 
-Starts as HTTP, upgrades to a persistent TCP connection. Both sides can send at any time. Server streams simulated 2330.TW (TSMC) stock prices -- open, high, low, close every second.
+Starts as HTTP, upgrades to a persistent TCP connection. Both sides can send at any time. Server streams simulated 2330.TW (TSMC) stock prices every second.
 
-**Web**: Click "Connect". Prices appear in a live dashboard. Close goes up, background flashes red. Close goes down, flashes green. History table scrolls with every tick. Click "Disconnect" to close.
+**How the server handles it**:
 
-**Go client**: Connects, prints an OHLC table. Each row shows the price and an arrow.
+Server runs two goroutines per connection:
+
+```go
+// goroutine 1: reads (detects client disconnect)
+go func() {
+    for {
+        if _, _, err := conn.ReadMessage(); err != nil {
+            return  // client sent close frame
+        }
+    }
+}()
+
+// goroutine 2: writes (pushes prices)
+for {
+    conn.WriteMessage(websocket.TextMessage, priceJSON)
+    time.Sleep(1 * time.Second)
+}
+```
+
+The reader goroutine exists only to detect disconnect. Without it, the server keeps pushing into the void forever -- `WriteMessage` doesn't fail just because the client is gone. It needs someone reading to catch the close frame.
+
+**Web vs Go client -- the close frame**:
+
+When the browser calls `ws.close()`, it sends a WebSocket close frame (opcode 0x8). The server's reader goroutine receives it, `ReadMessage` returns an error, the `done` channel closes, and the writer loop stops.
+
+The Go client (`gorilla/websocket`) does the same thing when you call `conn.Close()`. Same close frame, same protocol. The difference is what happens next: the browser's `onclose` callback fires automatically. In Go, you handle the error from `ReadMessage` yourself.
+
+**Web vs Go client -- the display**:
+
+Web shows a live dashboard: big price number, red/green flash on change, scrolling OHLC history table.
+
+Go prints a table:
 
 ```
 TIME       OPEN       HIGH       LOW        CLOSE
@@ -73,7 +139,7 @@ TIME       OPEN       HIGH       LOW        CLOSE
 22:15:04   604.73     606.11     602.88     602.88   ▼
 ```
 
-Same data from the same server. The web client makes it visual. The Go client keeps it tabular.
+Same JSON from the same server. Same WebSocket connection. Different rendering.
 
 Key difference from SSE: the client can also send data back on the same connection. SSE is one-way. WebSocket is two-way.
 
@@ -86,7 +152,7 @@ resp, err := client.Ping(ctx, &PingRequest{Message: "ping"})
 fmt.Println(resp.Message) // "pong"
 ```
 
-What actually happens under the hood:
+What actually happens:
 
 1. gRPC serializes `PingRequest` into protobuf bytes
 2. Sends over HTTP/2 to `localhost:50051`
@@ -95,21 +161,38 @@ What actually happens under the hood:
 5. Serializes, sends back over HTTP/2
 6. Client deserializes, you get `resp.Message = "pong"`
 
-**Web**: Can't call gRPC directly from a browser. gRPC uses HTTP/2 binary frames that browsers don't expose. The panel shows the CLI command instead.
+**Web vs Go client -- completely different**:
 
-**Go client**: `grpc.NewClient(...)`, call `client.Ping(...)`, print result. One shot, exits.
+The Go client calls `localhost:50051` directly over HTTP/2 with binary protobuf frames.
 
-With REST, you wire up routes, parse JSON, handle errors yourself. With gRPC, `protoc` generates the client stub and server interface from your `.proto` file. Type-safe, binary, fast.
+The browser can't do this. Browsers expose HTTP/2 for normal requests, but gRPC needs low-level control over HTTP/2 frames that the browser API doesn't provide. You'd need a gRPC-Web proxy (like Envoy) sitting between the browser and the gRPC server, translating HTTP/1.1 into gRPC's HTTP/2 framing.
+
+This project doesn't set up that proxy. The web panel just shows the CLI command instead.
+
+With REST, you wire up routes, parse JSON, handle errors yourself. With gRPC, `protoc` generates the client stub and server interface from your `.proto` file. Type-safe, binary, fast. The trade-off: harder to use from browsers.
 
 ### Long Polling
 
-Client sends a request. Server doesn't respond. It holds the connection and waits. When an event happens -- could be 1 second, could be 20 seconds -- server finally responds. Client gets the answer, connection closes. Client immediately sends another request. Waits again.
+Client sends GET. Server doesn't respond. It holds the connection, waiting for an event. Event arrives -- could be 1 second, could be 20 -- server responds. Connection closes. Client sends another GET. Waits again.
 
-**Web**: Click "Start Polling". The request goes pending -- you can see it spinning. An event arrives (random 1-8s), the log shows `[auto] build #37 passed`. Or click "Trigger Event" to fire one manually. You have to click again to poll the next event.
+**How the server handles it**:
 
-**Go client**: Runs a `for` loop. Each iteration sends `http.Get(...)`, blocks until server responds, prints the event, then loops and sends another request. Looks continuous, but it's not -- each loop is a new HTTP connection.
+```go
+select {
+case msg := <-longPollCh:              // manual trigger arrived
+    json.NewEncoder(w).Encode(msg)
+case <-time.After(delay):              // random 1-8s, simulates a real event
+    json.NewEncoder(w).Encode(event)
+case <-r.Context().Done():             // client gave up
+    return
+}
+```
 
-**Why the difference?** The Go client auto-loops because it's a demo that runs until you Ctrl+C. The web client makes you click each time so you can see the request go pending, watch it hang, and feel the moment the server finally responds. If it auto-looped, it would look identical to SSE -- the whole point is to see each request-response cycle happen one at a time.
+Three things can end the wait: an event, a timeout, or the client disconnecting. Whichever happens first wins.
+
+**Web vs Go client -- the re-poll difference**:
+
+The Go client runs a `for` loop. Each iteration sends `http.Get(...)`, blocks until server responds, then immediately sends another. Looks continuous:
 
 ```
 [1] waiting...
@@ -118,13 +201,21 @@ Client sends a request. Server doesn't respond. It holds the connection and wait
 [2] server -> [auto] build #37 passed  (22:08:04)
 ```
 
-It looks like the client is "always connected." It's not. Each `waiting -> responded` pair is a separate HTTP connection. Server log confirms it:
+But it's not one connection. Each `waiting -> responded` pair is a separate HTTP cycle. Server log proves it:
 
 ```
 22:07:43 [longpoll] client waiting...      <- connection 1
 22:07:51 [longpoll] responded after 8s     <- connection 1 ends
 22:07:51 [longpoll] client waiting...      <- connection 2 (new)
 ```
+
+The web client makes you click "Start Polling" each time. This is intentional. If it auto-looped, it would look identical to SSE. The point is to see the request go pending, watch it hang in the network tab, and feel the moment the server finally responds.
+
+**Web vs Go client -- cancellation**:
+
+The web client uses `AbortController` to cancel a pending request. Browser sends a signal, server's `r.Context().Done()` fires, handler returns. Clean.
+
+The Go client has no cancel button. It blocks on `http.Get(...)` until the server responds. You stop it with Ctrl+C, which kills the whole process.
 
 This is the oldest trick in the book. Facebook's first Messenger used it. Works everywhere -- no special protocol needed, just plain HTTP.
 
