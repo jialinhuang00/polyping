@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"time"
@@ -12,8 +15,6 @@ import (
 	"google.golang.org/grpc"
 
 	pb "polyping/proto/pingpb"
-
-	"context"
 )
 
 // gRPC server
@@ -66,6 +67,15 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+type tick struct {
+	Symbol string  `json:"symbol"`
+	Open   float64 `json:"open"`
+	High   float64 `json:"high"`
+	Low    float64 `json:"low"`
+	Close  float64 `json:"close"`
+	Time   string  `json:"time"`
+}
+
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -73,28 +83,107 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	log.Println("[ws] client connected")
+	log.Println("[ws] client connected — streaming 2330 prices")
+
+	// read goroutine: detects client close frame
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+
+	price := 590.0 + rand.Float64()*20 // start around 590~610
 
 	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			log.Printf("[ws] read error: %v", err)
+		select {
+		case <-done:
+			log.Println("[ws] client disconnected")
+			return
+		default:
+		}
+		// simulate OHLC candle
+		open := price
+		change1 := (rand.Float64() - 0.5) * 6
+		change2 := (rand.Float64() - 0.5) * 6
+		change3 := (rand.Float64() - 0.5) * 6
+		prices := []float64{open, open + change1, open + change2, open + change3}
+
+		high, low := prices[0], prices[0]
+		for _, p := range prices {
+			if p > high {
+				high = p
+			}
+			if p < low {
+				low = p
+			}
+		}
+		close := prices[3]
+		price = close // next candle opens here
+
+		t := tick{
+			Symbol: "2330",
+			Open:   math.Round(open*100) / 100,
+			High:   math.Round(high*100) / 100,
+			Low:    math.Round(low*100) / 100,
+			Close:  math.Round(close*100) / 100,
+			Time:   time.Now().Format("15:04:05"),
+		}
+
+		data, _ := json.Marshal(t)
+		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			log.Println("[ws] client disconnected")
 			return
 		}
-		log.Printf("[ws] received: %s", msg)
-		if err := conn.WriteMessage(websocket.TextMessage, []byte("pong")); err != nil {
-			log.Printf("[ws] write error: %v", err)
-			return
-		}
+		log.Printf("[ws] 2330 close=%.2f", t.Close)
+		time.Sleep(1 * time.Second)
 	}
 }
 
+var longPollCh = make(chan string, 1)
+
 func longPollHandler(w http.ResponseWriter, r *http.Request) {
-	log.Println("[longpoll] holding connection...")
-	time.Sleep(3 * time.Second)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"message": "pong"})
-	log.Println("[longpoll] responded")
+	log.Println("[longpoll] client waiting...")
+
+	// simulate: event arrives after 1~8 seconds randomly
+	delay := time.Duration(1+rand.Intn(8)) * time.Second
+
+	events := []string{
+		"user jia joined the room",
+		"order #4821 payment confirmed",
+		"build #37 passed",
+		"sensor-12 temperature alert: 78°C",
+		"deployment v2.3.1 rolled out",
+	}
+
+	select {
+	case msg := <-longPollCh:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"event": "manual", "message": msg})
+		log.Printf("[longpoll] responded (manual trigger): %s", msg)
+	case <-time.After(delay):
+		event := events[rand.Intn(len(events))]
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"event": "auto", "message": event})
+		log.Printf("[longpoll] responded after %s: %s", delay, event)
+	case <-r.Context().Done():
+		log.Println("[longpoll] client disconnected")
+	}
+}
+
+// POST /poll/send — simulate an event arriving
+func longPollSendHandler(w http.ResponseWriter, r *http.Request) {
+	select {
+	case longPollCh <- "pong":
+		log.Println("[longpoll] event sent")
+		w.Write([]byte("sent"))
+	default:
+		log.Println("[longpoll] no client waiting")
+		w.Write([]byte("no client waiting"))
+	}
 }
 
 func corsMiddleware(next http.Handler) http.Handler {
@@ -131,6 +220,7 @@ func main() {
 	mux.HandleFunc("/sse/ping", sseHandler)
 	mux.HandleFunc("/ws/ping", wsHandler)
 	mux.HandleFunc("/poll/ping", longPollHandler)
+	mux.HandleFunc("/poll/send", longPollSendHandler)
 
 	log.Println("HTTP server listening on :8080")
 	if err := http.ListenAndServe(":8080", corsMiddleware(mux)); err != nil {

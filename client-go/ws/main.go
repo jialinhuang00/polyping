@@ -1,12 +1,21 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+type tick struct {
+	Symbol string  `json:"symbol"`
+	Open   float64 `json:"open"`
+	High   float64 `json:"high"`
+	Low    float64 `json:"low"`
+	Close  float64 `json:"close"`
+	Time   string  `json:"time"`
+}
 
 func main() {
 	conn, _, err := websocket.DefaultDialer.Dial("ws://localhost:8080/ws/ping", nil)
@@ -15,20 +24,30 @@ func main() {
 	}
 	defer conn.Close()
 
-	fmt.Println("connected. sending ping every second. Ctrl+C to stop.")
+	fmt.Println("connected. streaming 2330 prices. Ctrl+C to stop.")
+	fmt.Printf("%-10s %-10s %-10s %-10s %-10s\n", "TIME", "OPEN", "HIGH", "LOW", "CLOSE")
+	fmt.Println("---------------------------------------------------")
 
-	for i := 1; ; i++ {
-		if err := conn.WriteMessage(websocket.TextMessage, []byte("ping")); err != nil {
-			log.Fatal(err)
-		}
-		fmt.Printf("[%d] > ping\n", i)
-
+	var prev float64
+	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("[%d] < %s\n", i, msg)
+		var t tick
+		json.Unmarshal(msg, &t)
 
-		time.Sleep(1 * time.Second)
+		arrow := "  "
+		if prev > 0 {
+			if t.Close > prev {
+				arrow = "▲"
+			} else if t.Close < prev {
+				arrow = "▼"
+			}
+		}
+		prev = t.Close
+
+		fmt.Printf("%-10s %-10.2f %-10.2f %-10.2f %-10.2f %s\n",
+			t.Time, t.Open, t.High, t.Low, t.Close, arrow)
 	}
 }
