@@ -36,6 +36,20 @@ func restHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"message": "pong"})
 }
 
+var buildSteps = []string{
+	"cloning repository...",
+	"installing dependencies...",
+	"compiling src/main.go...",
+	"compiling src/handler.go...",
+	"compiling src/middleware.go...",
+	"running tests... 14 passed, 0 failed",
+	"building docker image...",
+	"pushing to registry...",
+	"deploying to staging...",
+	"health check passed",
+	"build #42 complete",
+}
+
 func sseHandler(w http.ResponseWriter, r *http.Request) {
 	log.Println("[sse] client connected")
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -49,18 +63,20 @@ func sseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for {
+	for _, step := range buildSteps {
 		select {
 		case <-r.Context().Done():
 			log.Println("[sse] client disconnected")
 			return
 		default:
-			log.Println("[sse] pushing pong")
-			fmt.Fprintf(w, "data: pong\n\n")
+			log.Printf("[sse] pushing: %s", step)
+			fmt.Fprintf(w, "data: %s\n\n", step)
 			flusher.Flush()
-			time.Sleep(1 * time.Second)
+			delay := time.Duration(500+rand.Intn(2000)) * time.Millisecond
+			time.Sleep(delay)
 		}
 	}
+	log.Println("[sse] build stream finished")
 }
 
 var upgrader = websocket.Upgrader{
@@ -96,7 +112,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	price := 590.0 + rand.Float64()*20 // start around 590~610
+	price := 1800.0 + rand.Float64()*30 // start around 1800~1830
 
 	for {
 		select {
@@ -152,7 +168,7 @@ func longPollHandler(w http.ResponseWriter, r *http.Request) {
 	delay := time.Duration(1+rand.Intn(8)) * time.Second
 
 	events := []string{
-		"user jia joined the room",
+		"user lin joined the room",
 		"order #4821 payment confirmed",
 		"build #37 passed",
 		"sensor-12 temperature alert: 78°C",

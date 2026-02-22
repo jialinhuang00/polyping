@@ -1,38 +1,109 @@
 # Polyping
 
-5 ways to send "ping" and get "pong". Same result, different transport.
+HTTP can only do one thing: client asks, server answers.
 
-| Method | Endpoint | How it works |
-|--------|----------|-------------|
-| REST | GET /rest/ping | Request-response. One ping, one pong. |
-| SSE | GET /sse/ping | Server pushes "pong" every second. Client just listens. |
-| WebSocket | WS /ws/ping | One connection stays open. Server streams 2330.TW stock prices. |
-| gRPC | PingService.Ping | Feels like a function call. Actually crosses the network. |
-| Long Polling | GET /poll/ping | Server holds until an event happens, then responds. Client re-requests. |
+That's fine for loading a page. Not fine when the server has something to say and nobody asked. Stock prices changed. A build finished. A message arrived.
+
+So people invented workarounds. Five of them ended up mattering. This project runs all five against the same server, same payload, same "ping" → "pong". One Go server, three clients (Go, CLI, browser). You send a ping, you see how each protocol actually behaves.
+
+```
+REST         → ask once, get once, done
+Long Polling → ask once, server holds until it has something, then you ask again
+SSE          → ask once, server never stops answering
+WebSocket    → stop pretending it's HTTP, upgrade to a two-way connection
+gRPC         → call a function, it crosses the network (HTTP/2 + protobuf)
+```
+
+The chain: polling wastes bandwidth → long polling fixes that but reconnects every time → SSE keeps the connection open but is one-way → WebSocket goes two-way but needs a protocol upgrade → gRPC skips HTTP semantics entirely.
+
+| Method | Endpoint | What it does here |
+|--------|----------|-------------------|
+| REST | GET /rest/ping | Returns `{"message":"pong"}`. Connection closes. |
+| SSE | GET /sse/ping | Streams a fake CI build log. Content-Type: text/event-stream. Connection stays open until build finishes. |
+| WebSocket | WS /ws/ping | Upgrades to WebSocket. Server pushes 2330.TW stock prices every second. |
+| gRPC | PingService.Ping | Protobuf over HTTP/2. Feels like `ping()` → `"pong"`. Browser can't call it directly. |
+| Long Polling | GET /poll/ping | Server holds the response. Won't reply until there's data. Client must re-request after each response. |
 
 ---
 
 ## Quick Start
 
+Server first, then pick any client.
+
+### 1. Start the server
+
 ```bash
-# Terminal 1: start server
-cd server && go run main.go
+go run server/main.go
+```
 
-# Terminal 2: test each method
-go run client-go/rest/main.go
-go run client-go/sse/main.go
-go run client-go/ws/main.go
-go run client-go/grpc/main.go
-go run client-go/longpoll/main.go
+Server listens on :8080 (HTTP) and :50051 (gRPC). All 5 patterns run in one process.
 
-# Or use the CLI
+### 2. Pick a client
+
+You have three clients. They all talk to the same server.
+
+**client-go** -- 5 standalone programs, one per pattern:
+
+```bash
+go run client-go/rest/main.go        # prints "pong", exits
+go run client-go/sse/main.go         # streams build log, ends when build finishes
+go run client-go/ws/main.go          # streams 2330 prices, Ctrl+C to stop
+go run client-go/grpc/main.go        # prints "pong", exits
+go run client-go/longpoll/main.go    # loops: waits for event, prints, re-polls
+```
+
+**client-cli** -- one binary, `--mode` flag switches pattern:
+
+```bash
 go run client-cli/main.go --mode rest
+go run client-cli/main.go --mode sse
+go run client-cli/main.go --mode ws
+go run client-cli/main.go --mode grpc
+go run client-cli/main.go --mode longpoll
+```
 
-# Terminal 3: web UI
+Same code as client-go, packaged in one file.
+
+**client-web** -- React UI with a panel for each pattern:
+
+```bash
 cd client-web && npm run dev
 ```
 
-Server listens on :8080 (HTTP) and :50051 (gRPC).
+Open `http://localhost:5173`. Each panel has its own connect/send button. Vite proxies all requests to the Go server on :8080.
+
+**HTTPS (optional)** -- enables HTTP/2 in the browser:
+
+```bash
+brew install mkcert
+mkcert -install
+cd client-web
+mkdir -p .certs
+mkcert -cert-file .certs/localhost.pem -key-file .certs/localhost-key.pem localhost 127.0.0.1
+npm run dev   # now serves https://localhost:5173
+```
+
+With TLS, static assets serve over HTTP/2. WebSocket still falls back to HTTP/1.1 (Vite doesn't implement RFC 8441). Remove or rename `.certs/` to go back to HTTP.
+
+### 3. Testing checklist
+
+Run the server, then verify each pattern:
+
+| Pattern | What to do | What you should see |
+|---------|-----------|-------------------|
+| REST | `go run client-go/rest/main.go` | Prints `pong` and exits |
+| SSE | `go run client-go/sse/main.go` | Build steps appear one by one, stream ends |
+| WebSocket | `go run client-go/ws/main.go` | OHLC price table updates every second |
+| gRPC | `go run client-go/grpc/main.go` | Prints `pong` and exits |
+| Long Polling | `go run client-go/longpoll/main.go` | Waits 1-8s, prints event, waits again |
+
+For long polling, you can also trigger events manually:
+
+```bash
+curl -X POST localhost:8080/poll/send
+```
+
+For the web client, open the browser console's Network tab to watch requests go pending (long polling) or stay open (SSE, WebSocket).
 
 ---
 
@@ -71,19 +142,33 @@ One function. Stateless. No difference whether the request came from a browser o
 
 ### SSE (Server-Sent Events)
 
-Client opens one HTTP connection. Server never closes it. It keeps writing `data: pong\n\n` down the wire every second. Client just listens.
+One HTTP response that never ends. Client opens with `EventSource`. Server responds with `Content-Type: text/event-stream` -- that's the only Content-Type SSE uses. Then it keeps writing, and the connection stays open.
+
+Here, it streams a simulated CI build log. Each step appears as it "completes," with random delays.
 
 **How the server handles it**:
 
 ```go
-for {
-    fmt.Fprintf(w, "data: pong\n\n")
+for _, step := range buildSteps {
+    fmt.Fprintf(w, "data: %s\n\n", step)
     flusher.Flush()
-    time.Sleep(1 * time.Second)
+    time.Sleep(randomDelay)
 }
 ```
 
-It's a loop that writes to the response body and flushes. The HTTP response never "finishes." The connection stays open until the client disconnects or the server crashes.
+A loop that writes each build step to the response body and flushes. The connection stays open until all steps finish or the client disconnects.
+
+**Web**: Click "Start Build". Steps appear one by one. Green text when complete. Click "Cancel" to disconnect mid-build.
+
+**Go client**: Prints each step with a timestamp. Stream ends when the build finishes.
+
+```
+[11:30:01] cloning repository...
+[11:30:02] installing dependencies...
+[11:30:04] compiling src/main.go...
+[11:30:05] running tests... 14 passed, 0 failed
+[11:30:07] build #42 complete
+```
 
 **Web vs Go client -- the disconnect difference**:
 
@@ -95,7 +180,11 @@ Another difference: `EventSource` auto-reconnects if the connection drops. The G
 
 ### WebSocket
 
-Starts as HTTP, upgrades to a persistent TCP connection. Both sides can send at any time. Server streams simulated 2330.TW (TSMC) stock prices every second.
+Starts as HTTP/1.1, then upgrades. After the `101 Switching Protocols` response, it's not HTTP anymore. Different protocol, different framing, two-way.
+
+HTTP/2 has its own mechanism (RFC 8441, uses CONNECT instead of Upgrade), but almost nobody implements it. Browsers, Vite, Go's standard library -- all fall back to HTTP/1.1 for the WebSocket handshake.
+
+Here, server streams simulated 2330.TW (TSMC) stock prices every second.
 
 **How the server handles it**:
 
@@ -145,7 +234,7 @@ Key difference from SSE: the client can also send data back on the same connecti
 
 ### gRPC
 
-Feels like a local function call. Actually crosses the network.
+Feels like a local function call. Actually crosses the network over HTTP/2 with binary protobuf frames. Browsers can't call gRPC directly -- they expose HTTP/2 for normal requests, but gRPC needs low-level frame control the browser API doesn't provide. You'd need a gRPC-Web proxy (Envoy) in between.
 
 ```go
 resp, err := client.Ping(ctx, &PingRequest{Message: "ping"})
@@ -163,17 +252,15 @@ What actually happens:
 
 **Web vs Go client -- completely different**:
 
-The Go client calls `localhost:50051` directly over HTTP/2 with binary protobuf frames.
-
-The browser can't do this. Browsers expose HTTP/2 for normal requests, but gRPC needs low-level control over HTTP/2 frames that the browser API doesn't provide. You'd need a gRPC-Web proxy (like Envoy) sitting between the browser and the gRPC server, translating HTTP/1.1 into gRPC's HTTP/2 framing.
-
-This project doesn't set up that proxy. The web panel just shows the CLI command instead.
+The Go client calls `localhost:50051` directly. The browser can't. The web panel just shows the CLI command instead.
 
 With REST, you wire up routes, parse JSON, handle errors yourself. With gRPC, `protoc` generates the client stub and server interface from your `.proto` file. Type-safe, binary, fast. The trade-off: harder to use from browsers.
 
 ### Long Polling
 
-Client sends GET. Server doesn't respond. It holds the connection, waiting for an event. Event arrives -- could be 1 second, could be 20 -- server responds. Connection closes. Client sends another GET. Waits again.
+Not a protocol. Just a hack on plain HTTP.
+
+Client sends GET. Server doesn't respond. It holds the connection, waiting for something to happen. Could be 1 second, could be 30. When it finally has data, it responds. Connection closes. Client code must send a new request to keep listening -- there's no auto-reconnect, you write that loop yourself.
 
 **How the server handles it**:
 
