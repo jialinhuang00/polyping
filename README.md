@@ -381,6 +381,35 @@ Without all three, the command fails silently or with cryptic errors.
 
 ---
 
+## Future
+
+These five cover the mainstream. Everything else is either a variant or a niche protocol.
+
+**Worth adding:**
+
+- **WebTransport** — the real successor to WebSocket. Runs on HTTP/3 (QUIC). Supports multiple streams and unreliable datagrams (UDP-like). Good for games, video, anything latency-sensitive. Browser support still early.
+- **GraphQL Subscriptions** — usually WebSocket underneath, but with GraphQL query semantics on top. Would show how a higher-level abstraction wraps a lower-level transport.
+
+**Probably not, but interesting:**
+
+- **Socket.IO** — not a protocol. A library that starts with long polling, then auto-upgrades to WebSocket. Adds rooms, reconnection, broadcasting. Would blur the line between transport and framework.
+- **MQTT** — pub/sub protocol for IoT. Lightweight, runs on TCP. Sensors reporting temperature every second. Different world from HTTP.
+- **AMQP** — message queue protocol (RabbitMQ). Not client-to-server, but client-to-broker-to-consumer. Different architecture entirely.
+
+| | client-web | client-go | client-cli |
+|---|---|---|---|
+| WebTransport | Browser has native API | quic-go library | Same |
+| GraphQL Subscriptions | WebSocket underneath | graphql client library | Same |
+| Socket.IO | Built for browsers | Go Socket.IO client exists | Same |
+| MQTT | MQTT over WebSocket only | paho.mqtt.golang on raw TCP | Same |
+| AMQP | Not possible. Browser can't reach TCP. Needs WebSocket proxy. | amqp091-go | Same |
+
+**Dead:**
+
+- **HTTP/2 Server Push** — server could push resources before the browser asked. Chrome removed support in 2022. Nobody used it right.
+
+---
+
 ## Project Structure
 
 ```
